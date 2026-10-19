@@ -1,180 +1,29 @@
-import express from "express";
-import helmet from "helmet";
-import dotenv from "dotenv";
-import Database from "better-sqlite3";
-import crypto from "node:crypto";
-import path from "node:path";
-import fs from "node:fs";
-import { fileURLToPath } from "node:url";
-
-dotenv.config();
-const app = express();
-const PORT = Number(process.env.PORT || 3000);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const dataDir = process.env.DATABASE_DIR || path.join(__dirname, "data");
-fs.mkdirSync(dataDir, { recursive: true });
-const db = new Database(path.join(dataDir, "strikgold.sqlite"));
-db.pragma("journal_mode = WAL");
-db.pragma("busy_timeout = 5000");
-db.exec(`
-CREATE TABLE IF NOT EXISTS orders (
-  id TEXT PRIMARY KEY, platform TEXT NOT NULL, pack TEXT NOT NULL,
-  amount INTEGER NOT NULL, currency TEXT NOT NULL, delivery TEXT NOT NULL,
-  contact TEXT NOT NULL, note TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'awaiting_payment',
-  payment_session TEXT, created_at TEXT NOT NULL
-);`);
-const CURRENCY = (process.env.CURRENCY || "RUB").toUpperCase();
-const packs = {
-  starter: { name: "Стартовый", amount: Number(process.env.PRICE_STARTER || 49900) },
-  advanced: { name: "Продвинутый", amount: Number(process.env.PRICE_ADVANCED || 99900) },
-  ultimate: { name: "Максимальный", amount: Number(process.env.PRICE_ULTIMATE || 199900) }
-};
-const validPlatforms = new Set(["PC", "Xbox", "PlayStation"]);
-const validDeliveries = new Set(["Через трансферный рынок", "Комфортный способ"]);
-const sessions = new Map();
-const paymentsConfigured = Boolean(process.env.YOOKASSA_SHOP_ID && process.env.YOOKASSA_SECRET_KEY && process.env.BASE_URL);
-
-function clean(s, max=500) { return String(s ?? "").trim().slice(0, max); }
-function rubles(kopecks) { return (kopecks / 100).toFixed(2); }
-function paymentAuth() {
-  return "Basic " + Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString("base64");
-}
-function auth(req, res, next) {
-  if (!process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET) return res.status(503).json({ error: "Админка не настроена. Заполните ADMIN_PASSWORD и SESSION_SECRET." });
-  const token = req.get("x-admin-token");
-  const expected = crypto.createHmac("sha256", process.env.SESSION_SECRET).update(process.env.ADMIN_PASSWORD).digest("hex");
-  const got = Buffer.from(String(token || "").padEnd(64, " ").slice(0,64));
-  if (!token || !crypto.timingSafeEqual(got, Buffer.from(expected))) return res.status(401).json({ error: "Не авторизован" });
-  next();
-}
-async function notifyTelegram(text) {
-  const token = process.env.TELEGRAM_BOT_TOKEN, chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
-    });
-    if (!response.ok) console.error("Telegram notification failed with HTTP", response.status);
-  } catch (e) { console.error("Telegram notification failed:", e.message); }
-}
-
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "30kb" }));
-app.use(express.static(path.join(__dirname, "public")));
-
-app.get("/api/health", (_req,res) => res.json({ ok: true }));
-app.get("/api/config", (_req,res) => {
-  res.json({ currency: CURRENCY, packs: Object.fromEntries(Object.entries(packs).map(([k,v])=>[k,{name:v.name,amount:v.amount}])), paymentsEnabled: paymentsConfigured, paymentProvider: paymentsConfigured ? "yookassa" : null });
-});
-
-app.post("/api/orders", async (req,res) => {
-  const platform = clean(req.body.platform, 30), packKey = clean(req.body.pack, 30);
-  const delivery = clean(req.body.delivery, 80), contact = clean(req.body.contact, 180), note = clean(req.body.note, 1000);
-  if (!validPlatforms.has(platform)) return res.status(400).json({ error: "Выберите поддерживаемую платформу." });
-  if (!packs[packKey]) return res.status(400).json({ error: "Неизвестный пакет." });
-  if (!validDeliveries.has(delivery)) return res.status(400).json({ error: "Выберите способ доставки." });
-  if (contact.length < 3) return res.status(400).json({ error: "Укажите контакт для связи." });
-  if (!Number.isSafeInteger(packs[packKey].amount) || packs[packKey].amount <= 0) return res.status(500).json({ error: "Неверная цена пакета. Проверьте переменные PRICE_* на сервере." });
-  if (CURRENCY !== "RUB") return res.status(500).json({ error: "Этот проект настроен для RUB. Установите CURRENCY=RUB." });
-  const pack = packs[packKey], id = "SG-" + crypto.randomBytes(4).toString("hex").toUpperCase();
-  db.prepare(`INSERT INTO orders (id,platform,pack,amount,currency,delivery,contact,note,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run(id,platform,pack.name,pack.amount,CURRENCY,delivery,contact,note,paymentsConfigured ? "awaiting_payment" : "payment_not_configured",new Date().toISOString());
-
-  if (!paymentsConfigured) {
-    await notifyTelegram(`🆕 Новая заявка STRIKGOLD (онлайн-оплата не настроена)\nЗаказ: ${id}\nПлатформа: ${platform}\nПакет: ${pack.name}\nСумма: ${rubles(pack.amount)} RUB\nКонтакт: ${contact}\nДоставка: ${delivery}`);
-    return res.status(201).json({ orderId:id, paymentConfigured:false, message:"Заявка сохранена. Онлайн-оплата ещё не настроена." });
-  }
-
-  try {
-    const response = await fetch("https://api.yookassa.ru/v3/payments", {
-      method: "POST",
-      headers: { "Authorization": paymentAuth(), "Idempotence-Key": crypto.randomUUID(), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        amount: { value: rubles(pack.amount), currency: "RUB" },
-        capture: true,
-        confirmation: { type: "redirect", return_url: `${process.env.BASE_URL.replace(/\/$/, "")}/?payment=return&order=${encodeURIComponent(id)}` },
-        description: `STRIKGOLD — ${pack.name} (${platform}), заказ ${id}`,
-        metadata: { orderId: id, platform, pack: pack.name }
-      })
-    });
-    const payment = await response.json();
-    if (!response.ok || !payment.id || !payment.confirmation?.confirmation_url) {
-      console.error("YooKassa create payment failed:", response.status, JSON.stringify(payment).slice(0,1000));
-      db.prepare("UPDATE orders SET status='payment_error' WHERE id=?").run(id);
-      return res.status(502).json({ error:"ЮKassa не создала платёж. Проверьте Shop ID, секретный ключ и настройки магазина.", orderId:id });
-    }
-    db.prepare("UPDATE orders SET payment_session=? WHERE id=?").run(payment.id,id);
-    await notifyTelegram(`🧾 Создан заказ STRIKGOLD\nЗаказ: ${id}\nПлатформа: ${platform}\nПакет: ${pack.name}\nСумма: ${rubles(pack.amount)} RUB\nСтатус: ожидает оплату`);
-    return res.status(201).json({ orderId:id, paymentConfigured:true, checkoutUrl:payment.confirmation.confirmation_url, message:"Заказ создан. Сейчас откроется защищённая страница оплаты ЮKassa." });
-  } catch (err) {
-    console.error("YooKassa request failed:", err.message);
-    db.prepare("UPDATE orders SET status='payment_error' WHERE id=?").run(id);
-    return res.status(502).json({ error:"Не удалось связаться с ЮKassa. Проверьте настройки сервера.", orderId:id });
-  }
-});
-
-// ЮKassa webhook: доверяем не входящему JSON, а повторно запрашиваем платёж по API.
-app.post("/api/yookassa-webhook", async (req,res) => {
-  if (!paymentsConfigured) return res.status(503).send("Payments not configured");
-  const notification = req.body;
-  if (notification?.event !== "payment.succeeded" || notification?.object?.id == null) return res.status(200).json({ received:true, ignored:true });
-  try {
-    const response = await fetch(`https://api.yookassa.ru/v3/payments/${encodeURIComponent(notification.object.id)}`, {
-      headers: { "Authorization": paymentAuth(), "Accept": "application/json" }
-    });
-    if (!response.ok) {
-      console.error("YooKassa payment verification failed with HTTP", response.status);
-      return res.status(502).send("Could not verify payment");
-    }
-    const payment = await response.json();
-    if (payment.status !== "succeeded" || payment.paid !== true) return res.status(200).json({ received:true, ignored:true });
-    const orderId = clean(payment.metadata?.orderId, 50);
-    const row = db.prepare("SELECT * FROM orders WHERE id=? AND payment_session=?").get(orderId, payment.id);
-    if (!row) return res.status(200).json({ received:true, ignored:true });
-    if (payment.amount?.currency !== row.currency || Number(payment.amount?.value) !== Number(rubles(row.amount))) {
-      console.error("Payment amount/currency mismatch for order", row.id);
-      return res.status(400).send("Payment mismatch");
-    }
-    const changed = db.prepare("UPDATE orders SET status='paid' WHERE id=? AND status!='paid'").run(row.id).changes;
-    if (changed) await notifyTelegram(`✅ Оплата подтверждена ЮKassa\nЗаказ: ${row.id}\nПлатформа: ${row.platform}\nПакет: ${row.pack}\nСумма: ${rubles(row.amount)} ${row.currency}\nКонтакт: ${row.contact}`);
-    return res.status(200).json({ received:true });
-  } catch (err) {
-    console.error("YooKassa webhook verification error:", err.message);
-    return res.status(500).send("Webhook processing failed");
-  }
-});
-
-app.post("/api/admin/login", (req,res) => {
-  const password = clean(req.body.password, 300);
-  if (!process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET) return res.status(503).json({error:"Настройте секреты в переменных окружения"});
-  if (password !== process.env.ADMIN_PASSWORD) return res.status(401).json({error:"Неверный пароль"});
-  const token = crypto.createHmac("sha256",process.env.SESSION_SECRET).update(password).digest("hex");
-  sessions.set(token, Date.now()+8*60*60*1000);
-  res.json({token});
-});
-function adminSession(req,res,next) {
-  const token = req.get("x-admin-token"), expiry = token && sessions.get(token);
-  if (!expiry || expiry < Date.now()) return res.status(401).json({error:"Сессия истекла. Войдите снова."});
-  next();
-}
-app.get("/api/admin/orders", adminSession, (_req,res) => {
-  const rows = db.prepare("SELECT id,platform,pack,amount,currency,delivery,contact,note,status,created_at FROM orders ORDER BY created_at DESC LIMIT 500").all();
-  res.json({orders:rows});
-});
-app.patch("/api/admin/orders/:id", adminSession, (req,res) => {
-  const allowed = new Set(["awaiting_payment","paid","processing","completed","cancelled","payment_not_configured","payment_error"]);
-  const status = clean(req.body.status,40);
-  if (!allowed.has(status)) return res.status(400).json({error:"Недопустимый статус"});
-  const result = db.prepare("UPDATE orders SET status=? WHERE id=?").run(status,clean(req.params.id,50));
-  if (!result.changes) return res.status(404).json({error:"Заказ не найден"});
-  res.json({ok:true});
-});
-app.get("/api/admin/export", adminSession, (_req,res) => {
-  const rows = db.prepare("SELECT * FROM orders ORDER BY created_at DESC").all();
-  res.setHeader("content-type","application/json; charset=utf-8");
-  res.setHeader("content-disposition",'attachment; filename="strikgold-orders.json"');
-  res.send(JSON.stringify(rows,null,2));
-});
-app.get("*", (_req,res) => res.sendFile(path.join(__dirname,"public","index.html")));
-app.listen(PORT, "0.0.0.0", () => console.log(`STRIKGOLD listening on port ${PORT}; database directory: ${dataDir}`));
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090a0e"><title>STRIKGOLD — FC 27 Coins</title>
+<style>
+:root{--g:#f6c453;--g2:#ffe29a;--bg:#090a0e;--p:#141720;--line:#303543;--muted:#aab0bd;--green:#62dfa5}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 80% 0%,#33250f 0,transparent 33%),var(--bg);color:#f7f7fa;font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit;text-decoration:none}button,input,select{font:inherit}button{cursor:pointer}.wrap{width:min(1120px,92%);margin:auto}.top{position:sticky;top:0;z-index:5;background:#090a0eea;backdrop-filter:blur(12px);border-bottom:1px solid #ffffff17}.nav{height:70px;display:flex;align-items:center;justify-content:space-between;gap:16px}.logo{font-size:22px;font-weight:1000;letter-spacing:1px}.logo b,.gold{color:var(--g)}.links{display:flex;gap:22px;color:#c6c9d1}.btn{display:inline-flex;align-items:center;justify-content:center;padding:13px 17px;border-radius:11px;background:linear-gradient(135deg,var(--g2),#d59a27);color:#181309;font-weight:900;border:0}.btn.alt{background:#1c202a;border:1px solid #3b414f;color:#fff}.btn.sm{padding:9px 12px;font-size:13px}.hero{padding:60px 0 42px;display:grid;grid-template-columns:1.1fr .9fr;gap:30px;align-items:center}.eyebrow{font-size:12px;letter-spacing:2px;color:var(--g);font-weight:900}.hero h1{font-size:clamp(40px,6vw,72px);line-height:.98;letter-spacing:-2px;margin:15px 0}.lead{font-size:18px;color:#bbc0ca;max-width:570px}.chips{display:flex;gap:9px;flex-wrap:wrap;margin:20px 0}.chip{padding:8px 13px;border:1px solid #3b3d42;background:#141720;border-radius:10px;font-weight:850}.poster{min-height:330px;border-radius:23px;border:1px solid #715426;background:linear-gradient(145deg,#302414,#13161d 60%,#39270e);padding:25px;display:flex;flex-direction:column;justify-content:flex-end;position:relative;overflow:hidden}.poster:before{content:"27";position:absolute;right:-5px;top:-45px;font-size:270px;font-weight:1000;color:#ffcf5a12}.coin{position:absolute;right:24px;top:24px;border:7px double var(--g2);border-radius:50%;width:110px;height:110px;display:grid;place-items:center;font-weight:1000;font-size:28px;color:var(--g2);transform:rotate(10deg)}.poster h2{font-size:31px;line-height:1.05;max-width:300px;margin:0;position:relative}.poster p{color:#cbc4b7;position:relative}.section{padding:38px 0 48px}.head{margin-bottom:20px}.head h2{font-size:clamp(27px,4vw,37px);margin:4px 0}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}.card{background:linear-gradient(145deg,#171a23,#101218);border:1px solid var(--line);border-radius:17px;padding:20px}.card h3{margin:7px 0;font-size:21px}.price{font-size:28px;font-weight:950;margin:13px 0}.features{padding:0 0 0 18px;color:#c5cad4}.features li{margin:7px 0}.card .btn{width:100%;margin-top:10px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:13px}.field{display:flex;flex-direction:column;gap:6px}.full{grid-column:1/-1}label{font-size:13px;color:#cbd0d8;font-weight:750}input,select{width:100%;padding:13px;background:#0b0d12;border:1px solid #3b414d;border-radius:10px;color:#fff}input:focus,select:focus{outline:1px solid var(--g)}.notice{padding:12px;border:1px solid #6b5124;border-radius:10px;background:#251c0e;color:#e8d7ae;font-size:13px}.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.n{width:35px;height:35px;display:grid;place-items:center;background:#352912;color:var(--g);border-radius:10px;font-weight:900}.footer{border-top:1px solid var(--line);padding:25px 0 38px;color:#969dab;font-size:13px}.footrow{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap}.modal{display:none;position:fixed;inset:0;background:#000c;z-index:10;align-items:center;justify-content:center;padding:16px}.modal.show{display:flex}.modalbox{background:#12151d;border:1px solid #5b4826;border-radius:18px;padding:22px;width:min(760px,100%);max-height:90vh;overflow:auto;position:relative}.x{position:absolute;right:13px;top:7px;font-size:27px;color:white;background:none;border:0}.tabs{display:flex;gap:7px;margin:15px 0}.tab{flex:1;padding:10px;border:0;border-radius:9px;background:#242936;color:white}.tab.active{background:var(--g);color:#17120a;font-weight:900}.order{border:1px solid var(--line);border-radius:10px;padding:12px;margin:8px 0;overflow-wrap:anywhere}.tag{font-size:11px;color:var(--g);background:#2b2518;padding:3px 8px;border-radius:20px}.toast{display:none;position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:20;max-width:90%;padding:13px 17px;background:#17241e;border:1px solid #3a7758;border-radius:12px}.toast.show{display:block}.hidden{display:none!important}@media(max-width:760px){.links{display:none}.hero{grid-template-columns:1fr;padding-top:38px}.poster{min-height:270px}.grid,.steps{grid-template-columns:1fr}.formgrid{grid-template-columns:1fr}.full{grid-column:auto}.section{padding:28px 0 36px}.hero h1{letter-spacing:-1px}.poster:before{font-size:220px}}
+</style></head><body>
+<header class="top"><div class="wrap nav"><a class="logo" href="#"><b>STRIK</b>GOLD<span class="gold">.</span></a><nav class="links"><a href="#offers">Монеты</a><a href="#how">Доставка</a><a href="#order">Заказ</a></nav><button class="btn sm" onclick="openAccount()">Личный кабинет</button></div></header>
+<main><section class="wrap hero"><div><div class="eyebrow">ULTIMATE TEAM · FC 27</div><h1>СОБЕРИ КОМАНДУ<br><span class="gold">МЕЧТЫ</span></h1><p class="lead">Монеты для трансферного рынка. Выбери платформу и удобный способ доставки — оставь заявку за пару минут.</p><div class="chips"><span class="chip">▣ PC</span><span class="chip">✕ Xbox</span><span class="chip">◉ PlayStation</span></div><a class="btn" href="#offers">Выбрать пакет ↗</a><p class="muted" style="font-size:12px">STRIKGOLD — независимый магазин, не связанный с EA SPORTS.</p></div><div class="poster"><div class="coin">UT</div><div class="eyebrow">ТВОЙ СОСТАВ. ТВОИ ПРАВИЛА.</div><h2>БОЛЬШЕ ВОЗМОЖНОСТЕЙ НА РЫНКЕ</h2><p>Понятный заказ и поддержка на каждом этапе.</p><span class="tag">2 способа доставки</span></div></section>
+<section class="section wrap" id="offers"><div class="head"><div class="eyebrow">КАТАЛОГ</div><h2>Выбери пакет</h2><p class="muted">Демо-цены настраиваются через файл .env.</p></div><div class="grid"><article class="card"><div class="eyebrow">STARTER PACK</div><h3>Стартовый</h3><p class="muted">Для первых трансферов</p><div class="price" id="price-starter">—</div><ul class="features"><li>Выбор платформы</li><li>2 способа доставки</li><li>Поддержка по заказу</li></ul><button class="btn" onclick="selectPack('starter')">Выбрать</button></article><article class="card" style="border-color:#85632d"><div class="eyebrow">MOST POPULAR</div><h3>Продвинутый</h3><p class="muted">Больше гибкости на рынке</p><div class="price" id="price-advanced">—</div><ul class="features"><li>Выбор платформы</li><li>Приоритет обработки</li><li>Поддержка по заказу</li></ul><button class="btn" onclick="selectPack('advanced')">Выбрать</button></article><article class="card"><div class="eyebrow">ULTIMATE PACK</div><h3>Максимальный</h3><p class="muted">Для большого апгрейда</p><div class="price" id="price-ultimate">—</div><ul class="features"><li>Выбор платформы</li><li>Персональная консультация</li><li>Поддержка по заказу</li></ul><button class="btn" onclick="selectPack('ultimate')">Выбрать</button></article></div></section>
+<section class="section wrap" id="how"><div class="head"><div class="eyebrow">ПРОСТО И ПОНЯТНО</div><h2>Как это работает</h2></div><div class="steps"><div class="card"><div class="n">01</div><h3>Выбери платформу</h3><p class="muted">PC, Xbox или PlayStation.</p></div><div class="card"><div class="n">02</div><h3>Оформи заявку</h3><p class="muted">Укажи пакет, способ доставки и контакт.</p></div><div class="card"><div class="n">03</div><h3>Оплати заказ</h3><p class="muted">После настройки платёжного провайдера откроется защищённая страница оплаты.</p></div></div></section>
+<section class="section wrap" id="order"><div class="head"><div class="eyebrow">ОФОРМЛЕНИЕ</div><h2>Оставить заявку</h2><p class="muted">Данные отправляются на сервер магазина.</p></div><div class="card"><form id="orderForm" class="formgrid"><div class="field"><label for="platform">Платформа</label><select id="platform"><option>PC</option><option>Xbox</option><option>PlayStation</option></select></div><div class="field"><label for="pack">Пакет</label><select id="pack"><option value="starter">Стартовый</option><option value="advanced">Продвинутый</option><option value="ultimate">Максимальный</option></select></div><div class="field"><label for="delivery">Способ доставки</label><select id="delivery"><option>Через трансферный рынок</option><option>Комфортный способ</option></select></div><div class="field"><label for="contact">Telegram или email</label><input id="contact" required minlength="3" placeholder="@username или email"></div><div class="field full"><label for="note">Комментарий (необязательно)</label><input id="note" maxlength="1000" placeholder="Пожелания к заказу"></div><div class="field full"><button class="btn" type="submit">Создать заказ и перейти к оплате</button><div class="notice">Перед запуском замените демонстрационные цены, настройте платёжный аккаунт и проверьте доступность сервиса в вашей стране.</div></div></form><div id="result"></div></div></section></main>
+<footer class="footer"><div class="wrap footrow"><div><div class="logo"><b>STRIK</b>GOLD.</div>Независимый магазин игровых услуг</div><div>PC · Xbox · PlayStation<br>© 2026 STRIKGOLD</div><div><button class="btn alt sm" onclick="openAccount()">Админка / заказы</button></div></div></footer>
+<div class="modal" id="account"><div class="modalbox"><button class="x" onclick="closeAccount()">×</button><div class="eyebrow">STRIKGOLD</div><h2>Управление магазином</h2><div class="tabs"><button class="tab active" onclick="tab('login',this)">Вход</button><button class="tab" onclick="tab('orders',this)">Заказы</button><button class="tab" onclick="tab('settings',this)">Подключения</button></div><div id="accountBody"><form id="loginForm"><div class="field"><label>Пароль администратора</label><input id="adminPassword" type="password" required autocomplete="current-password"></div><p><button class="btn" type="submit">Войти</button></p></form></div></div></div><div id="toast" class="toast"></div>
+<script>
+let config=null, adminToken=sessionStorage.getItem('sg_admin_token')||'';
+const $=id=>document.getElementById(id);
+function money(c){return new Intl.NumberFormat('ru-RU',{style:'currency',currency:(config?.currency||'eur').toUpperCase(),maximumFractionDigits:2}).format(c/100)}
+function toast(t){$('toast').textContent=t;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),4000)}
+async function loadConfig(){try{let r=await fetch('/api/config');config=await r.json();for(let k of ['starter','advanced','ultimate'])$('price-'+k).textContent=money(config.packs[k].amount);if(!config.paymentsEnabled)toast('Внимание: онлайн-оплата ещё не подключена.')}catch(e){toast('Не удалось подключиться к серверу.')}}
+function selectPack(k){$('pack').value=k;location.hash='order'}
+$('orderForm').addEventListener('submit',async e=>{e.preventDefault();const btn=e.submitter;btn.disabled=true;btn.textContent='Создаём заказ…';try{const r=await fetch('/api/orders',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({platform:$('platform').value,pack:$('pack').value,delivery:$('delivery').value,contact:$('contact').value,note:$('note').value})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Ошибка заказа');$('result').innerHTML=`<div class="order"><b class="gold">Заказ ${d.orderId}</b><br>${d.message||'Заказ создан. Сейчас откроется защищённая оплата.'}</div>`;if(d.checkoutUrl)location.href=d.checkoutUrl;else toast(d.message||'Заказ создан');}catch(err){toast(err.message)}finally{btn.disabled=false;btn.textContent='Создать заказ и перейти к оплате'}});
+function openAccount(){$('account').classList.add('show')}function closeAccount(){$('account').classList.remove('show')}
+$('account').addEventListener('click',e=>{if(e.target===$('account'))closeAccount()});
+$('loginForm').addEventListener('submit',async e=>{e.preventDefault();try{const r=await fetch('/api/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:$('adminPassword').value})});const d=await r.json();if(!r.ok)throw new Error(d.error);adminToken=d.token;sessionStorage.setItem('sg_admin_token',adminToken);tab('orders',document.querySelectorAll('.tab')[1]);}catch(err){toast(err.message)}});
+async function tab(t,el){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));el.classList.add('active');const b=$('accountBody');if(t==='login'){b.innerHTML='<form id="loginForm"><div class="field"><label>Пароль администратора</label><input id="adminPassword" type="password" required autocomplete="current-password"></div><p><button class="btn">Войти</button></p></form>';return}if(t==='settings'){b.innerHTML='<h3>Статус подключений</h3><p class="muted">Секреты хранятся на сервере в .env. Telegram и платежи активируются после заполнения ключей и перезапуска приложения.</p><p>Не размещайте ключи в браузерном коде.</p>';return}if(!adminToken){b.innerHTML='<p class="muted">Сначала войдите во вкладке «Вход».</p>';return}try{const r=await fetch('/api/admin/orders',{headers:{'x-admin-token':adminToken}});const d=await r.json();if(!r.ok)throw new Error(d.error);b.innerHTML='<h3>Заказы ('+d.orders.length+')</h3><p><a class="btn alt sm" href="/api/admin/export" onclick="return exportClick(event)">Экспорт JSON</a></p>'+d.orders.map(o=>`<div class="order"><b class="gold">${esc(o.id)}</b> · ${esc(o.platform)} · ${esc(o.pack)} · ${money(o.amount)}<br><small>${esc(o.contact)} · ${esc(o.created_at)}</small><p><label>Статус</label> <select onchange="setStatus('${esc(o.id)}',this.value)">${['awaiting_payment','paid','processing','completed','cancelled','payment_not_configured','payment_error'].map(s=>`<option ${s===o.status?'selected':''}>${s}</option>`).join('')}</select></p><small>${esc(o.delivery)}${o.note?' · '+esc(o.note):''}</small></div>`).join('')||'<p class="muted">Заказов пока нет.</p>'}catch(err){b.innerHTML='<p>'+esc(err.message)+'</p>';adminToken='';sessionStorage.removeItem('sg_admin_token')}}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function setStatus(id,status){try{const r=await fetch('/api/admin/orders/'+encodeURIComponent(id),{method:'PATCH',headers:{'content-type':'application/json','x-admin-token':adminToken},body:JSON.stringify({status})});const d=await r.json();if(!r.ok)throw new Error(d.error);toast('Статус обновлён')}catch(e){toast(e.message)}}
+function exportClick(e){e.preventDefault();fetch('/api/admin/export',{headers:{'x-admin-token':adminToken}}).then(r=>{if(!r.ok)throw Error('Не удалось экспортировать');return r.blob()}).then(blob=>{let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='strikgold-orders.json';a.click();URL.revokeObjectURL(a.href)}).catch(e=>toast(e.message));return false}
+loadConfig();
+</script></body></html>
